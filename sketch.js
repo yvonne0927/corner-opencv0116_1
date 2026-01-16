@@ -22,6 +22,89 @@ let freeze = {
 let currentMatType = "none";
 let currentMatInfo = "";
 
+// ===== UI fold (debug panel) =====
+let uiState = {
+  collapsed: true,   // 默认折叠
+  showN: 5           // 折叠时显示前 N 行
+};
+let uiToggleBtn;
+
+
+// ===== Drag rotate controls (mouse + touch) =====
+let dragCtrl = {
+  enabled: true,
+  dragging: false,
+  lastX: 0,
+  lastY: 0,
+  yaw: 0,    // 左右
+  pitch: 0,  // 上下
+  sensitivity: 0.006, // 旋转灵敏度
+  pitchMin: -Math.PI / 2 + 0.15,
+  pitchMax:  Math.PI / 2 - 0.15,
+};
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function attachDragRotate(domEl) {
+  if (!domEl) return;
+
+  const onDown = (e) => {
+    if (!dragCtrl.enabled) return;
+
+    // 避免拖拽按钮
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
+    if (tag === "button") return;
+
+    dragCtrl.dragging = true;
+    const p = getPointerXY(e);
+    dragCtrl.lastX = p.x;
+    dragCtrl.lastY = p.y;
+
+    // 捕获指针（防止移出画布就断）
+    if (domEl.setPointerCapture && e.pointerId != null) {
+      try { domEl.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+  };
+
+  const onMove = (e) => {
+    if (!dragCtrl.enabled || !dragCtrl.dragging) return;
+
+    const p = getPointerXY(e);
+    const dx = p.x - dragCtrl.lastX;
+    const dy = p.y - dragCtrl.lastY;
+    dragCtrl.lastX = p.x;
+    dragCtrl.lastY = p.y;
+
+    dragCtrl.yaw   += dx * dragCtrl.sensitivity;
+    dragCtrl.pitch += dy * dragCtrl.sensitivity;
+    dragCtrl.pitch = clamp(dragCtrl.pitch, dragCtrl.pitchMin, dragCtrl.pitchMax);
+
+    // ✅ 把旋转应用到模型（instF）
+    if (three && three.instF) {
+      // Y 轴左右旋转 + X 轴上下旋转（更像 3D 查看器）
+      three.instF.rotation.set(-dragCtrl.pitch, dragCtrl.yaw + Math.PI, 0);
+    }
+  };
+
+  const onUp = (e) => {
+    dragCtrl.dragging = false;
+  };
+
+  // Pointer events（同时支持鼠标+触摸）
+  domEl.addEventListener("pointerdown", onDown, { passive: true });
+  domEl.addEventListener("pointermove", onMove, { passive: true });
+  domEl.addEventListener("pointerup", onUp, { passive: true });
+  domEl.addEventListener("pointercancel", onUp, { passive: true });
+  domEl.addEventListener("pointerleave", onUp, { passive: true });
+}
+
+function getPointerXY(e) {
+  // pointer event
+  if (e.clientX != null) return { x: e.clientX, y: e.clientY };
+  // touch event fallback（一般不需要）
+  const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]);
+  return t ? { x: t.clientX, y: t.clientY } : { x: 0, y: 0 };
+}
 
 
 // Tracking (A/B stable boxes)
@@ -216,8 +299,10 @@ function initThreeOverlay() {
   three.renderer.domElement.style.left = "0";
   three.renderer.domElement.style.top = "0";
   three.renderer.domElement.style.zIndex = "5";
-  three.renderer.domElement.style.pointerEvents = "none";
+  three.renderer.domElement.style.pointerEvents = "auto";
   document.body.appendChild(three.renderer.domElement);
+  attachDragRotate(three.renderer.domElement);
+
 
   three.ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
@@ -384,6 +469,17 @@ function setup() {
    startBtn.style('z-index', '9999');
    lockBtn.style('position', 'fixed');
    lockBtn.style('z-index', '9999');
+
+   uiToggleBtn = createButton("UI: Collapsed ▾");
+uiToggleBtn.position(20, 120);
+uiToggleBtn.size(160, 36);
+uiToggleBtn.mousePressed(() => {
+  uiState.collapsed = !uiState.collapsed;
+  uiToggleBtn.html(uiState.collapsed ? "UI: Collapsed ▾" : "UI: Expanded ▴");
+});
+uiToggleBtn.style('position', 'fixed');
+uiToggleBtn.style('z-index', '9999');
+
 
 }
 
@@ -734,19 +830,19 @@ if (!lockMode && roi) {
   }
 
   // =========================
-  // D) UI panel（更小字 + 更靠左 + 背景自适应宽度）
-  // =========================
-  const uiX = 12;      // 更靠左
-  const uiY = 12;
-  const pad = 10;      // 内边距
-  const fontSize = 12; // ✅ 字变小（你也可以试 13）
-  const lineH = 16;    // 行距
+// D) UI panel (foldable)
+// =========================
+const uiX = 12;
+const uiY = 12;
+const pad = 10;
+const fontSize = 12;
+const lineH = 16;
 
-  textSize(fontSize);
-  textFont("monospace"); // 可选：更像调试UI
-  noStroke();
+textSize(fontSize);
+textFont("monospace");
+noStroke();
 
-  const safeFeats = roiFeats || {
+const safeFeats = roiFeats || {
   warmth: 0, brightness: 0, straightness: 0, texture: 0, smoothness: 0, lineCount: 0
 };
 
@@ -756,9 +852,9 @@ const safeRes = resultROI || {
   score: { Tendril: 0, GlyphLight: 0, CrystalShell: 0, Jelly: 0, SporeCloud: 0 }
 };
 
-
 const uiLines = [
   `cvReady: ${cvReady}`,
+  `marker: ${markerVisible}`,
   `edgePixels(ROI): ${edgePixels}`,
   `warmth (R-B): ${safeFeats.warmth.toFixed(1)}`,
   `brightness: ${safeFeats.brightness.toFixed(2)}`,
@@ -775,22 +871,24 @@ const uiLines = [
   `matInfo: ${currentMatInfo}`,
 ];
 
+// ✅ fold
+const drawLines = uiState.collapsed ? uiLines.slice(0, uiState.showN) : uiLines;
 
-  // ✅ 背景宽度=最长字符串宽度+padding（不会再过宽）
-  let maxW = 0;
-  for (const s of uiLines) maxW = Math.max(maxW, textWidth(s));
-  const panelW = maxW + pad * 2;
-  const panelH = uiLines.length * lineH + pad * 2;
+// 背景宽高自适应
+let maxW = 0;
+for (const s of drawLines) maxW = Math.max(maxW, textWidth(s));
+const panelW = maxW + pad * 2;
+const panelH = drawLines.length * lineH + pad * 2;
 
-  fill(0, 140); // 半透明背景
-  rect(uiX, uiY, panelW, panelH, 10);
+fill(0, 140);
+rect(uiX, uiY, panelW, panelH, 10);
 
-  fill(255);
-  let ty = uiY + pad + lineH - 4;
-  for (const s of uiLines) {
-    text(s, uiX + pad, ty);
-    ty += lineH;
-  }
+fill(255);
+let ty = uiY + pad + lineH - 4;
+for (const s of drawLines) {
+  text(s, uiX + pad, ty);
+  ty += lineH;
+}
 
   // E) draw boxes
   const scaleX = boxSize / roi.width;
@@ -1221,12 +1319,23 @@ const tintA = lerpRGB({ r: 160, g: 130, b: 255 }, { r: 255, g: 220, b: 240 }, B)
 base = lerpRGB(base, tintA, 0.35);
 
 // ✅ 最终再压暗一点（保持你的 melancholy）
-const base2 = lerpRGB({ r: 0, g: 0, b: 0 }, base, 0.45 + 0.55 * B);
+// ✅ Morandi：去饱和（加灰）+ 提亮（加白），不再压黑
+const grey  = { r: 190, g: 195, b: 200 };   // 柔灰
+const white = { r: 248, g: 248, b: 248 };   // 柔白
+
+// 先往灰里靠（降低饱和）
+let morandi = lerpRGB(base, grey, 0.45);    // 0.35~0.60 都可调
+
+// 再轻轻提亮（避免“脏暗”）
+morandi = lerpRGB(morandi, white, 0.18 + 0.22 * B);  // B 越亮越接近白
+
+const base2 = morandi;
+
 
   let opacity = clamp01(0.35 + 0.55 * M);
   let roughness = clamp01(0.85 - 0.75 * M);
   let metalness = clamp01((1 - W) * 0.5 + S * 0.3 + M * 0.3);
-  let emissiveStrength = clamp01(0.15 + 0.55 * (1 - W) + 0.30 * B);
+  let emissiveStrength = clamp01(0.05 + 0.25 * (1 - W) + 0.15 * B);
 
   if (organism === "Tendril") {
     opacity = clamp01(opacity - 0.25);
@@ -1259,14 +1368,17 @@ const base2 = lerpRGB({ r: 0, g: 0, b: 0 }, base, 0.45 + 0.55 * B);
     emissiveStrength = clamp01(emissiveStrength + 0.40);
   }
 
-  return {
+    return {
     baseColor: base2,
     opacity,
     roughness,
     metalness,
-    emissiveColor: base2,
-    emissiveStrength
+
+    // ✅ 不要再用 base2 当 emissive（它就是紫系来源）
+    emissiveColor: { r: 220, g: 230, b: 255 },  // 冷白偏蓝
+    emissiveStrength: clamp01(emissiveStrength * 0.18) // 大幅降低
   };
+
 }
 
 function applyAppearanceToModel(model, app, presetType = null) {
@@ -1274,31 +1386,46 @@ function applyAppearanceToModel(model, app, presetType = null) {
 
   const preset = presetType ? getMaterialPreset(presetType) : null;
 
-  // ✅ 第一次：把 mesh 材质换成 MeshPhysicalMaterial（玻璃/雾/珠光需要它）
+// ✅ 第一次：把 mesh 材质换成 MeshPhysicalMaterial + 写入顶点渐变（只做一次）
 if (!model.userData._materialCloned) {
   const seed = (model.userData._fusionSeed ?? 12345);
 
   model.traverse((child) => {
     if (!child.isMesh) return;
 
-    const old = child.material || {};
+    // 1) 取旧材质（可能是数组）
+    const oldMats = Array.isArray(child.material) ? child.material : [child.material];
 
-    child.material = new THREE.MeshPhysicalMaterial({
-      map: old.map || null,
-      normalMap: old.normalMap || null,
-      roughnessMap: old.roughnessMap || null,
-      metalnessMap: old.metalnessMap || null,
-      emissiveMap: old.emissiveMap || null,
-      aoMap: old.aoMap || null,
+    // 2) 为每个旧材质创建新的 Physical 材质（保留贴图）
+    const newMats = oldMats.map((old) => {
+      const m = new THREE.MeshPhysicalMaterial({
+        map: old?.map || null,
+        normalMap: old?.normalMap || null,
+        roughnessMap: old?.roughnessMap || null,
+        metalnessMap: old?.metalnessMap || null,
+        emissiveMap: old?.emissiveMap || null,
+        aoMap: old?.aoMap || null,
 
-      color: old.color ? old.color.clone() : new THREE.Color(1, 1, 1),
+        color: new THREE.Color(1, 1, 1),   // ✅ 不用单色盖掉顶点渐变
+        vertexColors: true,                // ✅ 启用顶点颜色
+        transparent: false
+      });
 
-      vertexColors: true,  // ✅ 启用顶点颜色
-      transparent: false
+      // 有些模型带 emissive / roughness 等初值，也可以继承
+      if (old && "roughness" in old) m.roughness = old.roughness;
+      if (old && "metalness" in old) m.metalness = old.metalness;
+
+      return m;
     });
 
-    // ✅ 只做一次：给这个 mesh 写入随机渐变（位置/大小随机，但可复现）
+    // 3) 写回材质（保持数组结构）
+    child.material = Array.isArray(child.material) ? newMats : newMats[0];
+
+    // 4) 写入顶点渐变（对 geometry）
     applyVertexGradient(child, seed + (child.id % 9999));
+
+    // 5) 更新
+    child.material.needsUpdate = true;
   });
 
   model.userData._materialCloned = true;
@@ -1306,62 +1433,67 @@ if (!model.userData._materialCloned) {
 
 
 
-  model.traverse((child) => {
+    model.traverse((child) => {
     if (!child.isMesh || !child.material) return;
-    const mat = child.material;
 
-    // 颜色（沿用你 app）
-    if (mat.color) {
-      mat.color.setRGB(app.baseColor.r / 255, app.baseColor.g / 255, app.baseColor.b / 255);
-    }
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
 
-    // 默认用 app
-    mat.transparent = false;
-    mat.opacity =  1.0;
-    mat.roughness = app.roughness;
-    mat.metalness = app.metalness;
+    for (const mat of mats) {
+      if (!mat) continue;
 
-    // 叠加 preset（玻璃/金属/珍珠/陶土/雾）
-    if (preset) {
-      const isTrans = (presetType === "glass" || presetType === "foggy");
-mat.transparent = isTrans;
-mat.opacity = isTrans ? 1.0 : 1.0; // 玻璃用 transmission，不靠 opacity
+      // ✅ 顶点色必须开 + baseColor 不要盖掉渐变
+      mat.vertexColors = true;
+      if (mat.color) mat.color.setRGB(1, 1, 1);
 
-      mat.roughness = preset.roughness;
-      mat.metalness = preset.metalness;
+      // 默认用 app
+      mat.transparent = false;
+      mat.opacity = 1.0;
+      mat.roughness = app.roughness;
+      mat.metalness = app.metalness;
 
-      mat.transmission = isTrans ? (preset.transmission ?? 0.0) : 0.0;
-mat.thickness    = isTrans ? (preset.thickness ?? 0.0) : 0.0;
-mat.ior          = isTrans ? (preset.ior ?? 1.0) : 1.0;
+      // 叠加 preset（玻璃/金属/珍珠/陶土/雾）
+      if (preset) {
+        const isTrans = (presetType === "glass" || presetType === "foggy");
+        mat.transparent = isTrans;
+        mat.opacity = 1.0;
 
+        mat.roughness = preset.roughness;
+        mat.metalness = preset.metalness;
 
-      mat.clearcoat = preset.clearcoat ?? 0.0;
-      mat.clearcoatRoughness = preset.clearcoatRoughness ?? 0.0;
+        mat.transmission = isTrans ? (preset.transmission ?? 0.0) : 0.0;
+        mat.thickness    = isTrans ? (preset.thickness ?? 0.0) : 0.0;
+        mat.ior          = isTrans ? (preset.ior ?? 1.0) : 1.0;
 
-      // 玻璃/雾：优先 transmission，不要靠 opacity 做透明
-      if ((preset.transmission ?? 0) > 0) mat.opacity = 1.0;
+        mat.clearcoat = preset.clearcoat ?? 0.0;
+        mat.clearcoatRoughness = preset.clearcoatRoughness ?? 0.0;
 
-      // 珍珠：iridescence（做兼容，不支持就跳过）
-      if ("iridescence" in mat && preset.iridescence != null) {
-        mat.iridescence = preset.iridescence;
-        mat.iridescenceIOR = preset.iridescenceIOR ?? 1.3;
-        if ("iridescenceThicknessRange" in mat && preset.iridescenceThicknessRange) {
-          mat.iridescenceThicknessRange = preset.iridescenceThicknessRange;
+        if ("iridescence" in mat && preset.iridescence != null) {
+          mat.iridescence = preset.iridescence;
+          mat.iridescenceIOR = preset.iridescenceIOR ?? 1.3;
+          if ("iridescenceThicknessRange" in mat && preset.iridescenceThicknessRange) {
+            mat.iridescenceThicknessRange = preset.iridescenceThicknessRange;
+          }
         }
+      } else {
+        mat.transmission = 0.0;
+        mat.thickness = 0.0;
+        mat.clearcoat = 0.0;
+
+        //  Morandi clamp：统一变浅 + 低饱和 + 不发黑
+        mat.roughness = Math.max(mat.roughness, 0.55); 
+        mat.metalness = Math.min(mat.metalness, 0.25); 
+        mat.envMapIntensity = 0.6;                     
+
       }
-    } else {
-      mat.transmission = 0.0;
-      mat.thickness = 0.0;
-      mat.clearcoat = 0.0;
-    }
 
-    // emissive（沿用你 app）
-    if (mat.emissive) {
-      mat.emissive.setRGB(app.emissiveColor.r / 255, app.emissiveColor.g / 255, app.emissiveColor.b / 255);
-      mat.emissiveIntensity = app.emissiveStrength + (preset?.emissiveBoost || 0);
-    }
+      // emissive 用“冷白弱光”，别用紫系染色
+      if (mat.emissive) {
+        mat.emissive.setRGB(app.emissiveColor.r / 255, app.emissiveColor.g / 255, app.emissiveColor.b / 255);
+        mat.emissiveIntensity = app.emissiveStrength + (preset?.emissiveBoost || 0);
+      }
 
-    mat.needsUpdate = true;
+      mat.needsUpdate = true;
+    }
   });
 }
 
@@ -1575,18 +1707,19 @@ function getMaterialPreset(type) {
         emissiveBoost: 0.0
       };
 
-    case "metal": // 金属
-      return {
-        transmission: 0.0,
-        ior: 1.0,
-        thickness: 0.0,
-        roughness: 0.2,
-        metalness: 1.0,
-        opacity: 1.0,
-        clearcoat: 0.15,
-        clearcoatRoughness: 0.2,
-        emissiveBoost: 0.0
-      };
+    case "metal": // ✅ Morandi satin metal (not pure black)
+    return {
+    transmission: 0.0,
+    ior: 1.0,
+    thickness: 0.0,
+    roughness: 0.65,   // ✅ 更糙=更柔和
+    metalness: 0.18,   // ✅ 关键：不要 1.0（没 env 会黑）
+    opacity: 1.0,
+    clearcoat: 0.35,
+    clearcoatRoughness: 0.55,
+    emissiveBoost: 0.03
+  };
+
 
     case "pearl": // 珍珠 / 珠光
       return {
@@ -1687,11 +1820,11 @@ function seededRand(seed) {
   seed = (seed * 1664525 + 1013904223) >>> 0;
   return seed / 4294967296;
 }
+
 function applyVertexGradient(mesh, seed = 1234) {
   const geo = mesh.geometry;
   if (!geo || !geo.attributes || !geo.attributes.position) return;
 
-  // 先保证是 BufferGeometry 且有 bounding box
   geo.computeBoundingBox();
   const bbox = geo.boundingBox;
   const size = new THREE.Vector3();
@@ -1700,63 +1833,139 @@ function applyVertexGradient(mesh, seed = 1234) {
   const pos = geo.attributes.position;
   const count = pos.count;
 
-  // 准备 color attribute
-  let col = geo.getAttribute('color');
+  // 确保 color attribute
+  let col = geo.getAttribute("color");
   if (!col || col.count !== count) {
     col = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
-    geo.setAttribute('color', col);
+    geo.setAttribute("color", col);
   }
 
-  // 随机生成 4 个“色云中心”
+  // ✅ Pastel + pearly palette（整体偏浅、冷雾感；紫色只做点缀）
+const PALETTE = [
+  // blues / cyans
+  new THREE.Color("#D6ECFF"), // baby blue
+  new THREE.Color("#C7F0FF"), // pale cyan
+  new THREE.Color("#BFE7FF"), // sky mist
+
+  // greens
+  new THREE.Color("#C9F2E3"), // mint
+  new THREE.Color("#B9E6D4"), // mint green
+  new THREE.Color("#C7DCCF"), // sage / grey-green
+  new THREE.Color("#BFD0C2"), // grey-green deeper (still light)
+
+  // neutrals (silver / pearl white)
+  new THREE.Color("#F2F6FA"), // pearl white (cool)
+  new THREE.Color("#E6EDF3"), // silver-ish cool gray
+  new THREE.Color("#D7DEE7"), // silver gray
+
+  // warm accents (soft)
+  new THREE.Color("#FFE4EE"), // watery pink (very light)
+  new THREE.Color("#FFD1DE"), // soft rose
+  new THREE.Color("#FFF2C7"), // soft buttery yellow
+  new THREE.Color("#FFE8B0"), // gentle warm yellow
+
+  // purple accents (rare)
+  new THREE.Color("#C8C1FF"), // lavender
+  new THREE.Color("#7D6BFF"), // grape purple
+];
+
+
+  function seededRandLocal(s) {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return [s, s / 4294967296];
+  }
+
+  function pickPaletteColor(rand01) {
+  // 对应上面 PALETTE 的权重（越大越常出现）
+  const weights = [
+    1.10, // baby blue
+    1.05, // pale cyan
+    1.00, // sky mist
+
+    1.25, // mint
+    1.20, // mint green
+    1.20, // sage
+    1.05, // grey-green deeper
+
+    1.35, // pearl white
+    1.20, // silver-ish cool gray
+    1.05, // silver gray
+
+    0.85, // watery pink
+    0.75, // soft rose
+    0.70, // buttery yellow
+    0.55, // gentle warm yellow
+
+    0.22, // lavender (rare)
+    0.12, // grape purple (very rare)
+  ];
+
+  let sum = 0;
+  for (const w of weights) sum += w;
+
+  let t = rand01 * sum;
+  for (let i = 0; i < weights.length; i++) {
+    t -= weights[i];
+    if (t <= 0) return PALETTE[i].clone();
+  }
+  return PALETTE[0].clone();
+}
+
+
+  // ✅ 生成多个“色云 blob”
   let s = seed >>> 0;
   const blobs = [];
-  const blobN = 4;
+  const blobN = 6; // 比你原来 4 个多一点，颜色会更丰富
 
   for (let i = 0; i < blobN; i++) {
-    const rx = seededRand(s = (s + 1) >>> 0);
-    const ry = seededRand(s = (s + 1) >>> 0);
-    const rz = seededRand(s = (s + 1) >>> 0);
+    let r;
+    [s, r] = seededRandLocal(s); const rx = r;
+    [s, r] = seededRandLocal(s); const ry = r;
+    [s, r] = seededRandLocal(s); const rz = r;
 
-    // 中心在 bbox 内随机
     const cx = bbox.min.x + rx * size.x;
     const cy = bbox.min.y + ry * size.y;
     const cz = bbox.min.z + rz * size.z;
 
-    // 半径随机（决定渐变块大小）
-    const r = (0.25 + 0.55 * seededRand(s = (s + 1) >>> 0)) * Math.max(size.x, size.y, size.z);
+    [s, r] = seededRandLocal(s);
+    const radius = (0.18 + 0.55 * r) * Math.max(size.x, size.y, size.z); // 多尺度
 
-    // 颜色随机（你的“冷光忧郁”色域：蓝紫/粉紫/冷白）
-    const t = seededRand(s = (s + 1) >>> 0);
-    const c1 = new THREE.Color().setHSL(0.65 + 0.15 * t, 0.55, 0.55); // 偏蓝紫
-    const c2 = new THREE.Color().setHSL(0.85 - 0.2 * t, 0.55, 0.62);  // 偏粉紫
-    const color = c1.lerp(c2, seededRand(s = (s + 1) >>> 0));
+    // ✅ 从 palette 抽两种颜色，再插值，得到 blob 自己的颜色
+    [s, r] = seededRandLocal(s);
+    const cA = pickPaletteColor(r);
 
-    blobs.push({ center: new THREE.Vector3(cx, cy, cz), r, color });
+    [s, r] = seededRandLocal(s);
+    const cB = pickPaletteColor(r);
+
+    [s, r] = seededRandLocal(s);
+    const c = cA.lerp(cB, r);
+
+    blobs.push({ center: new THREE.Vector3(cx, cy, cz), r: radius, color: c });
   }
 
   const p = new THREE.Vector3();
+  const out = new THREE.Color();
 
   for (let i = 0; i < count; i++) {
     p.fromBufferAttribute(pos, i);
 
-    // 基础色（你也可以改成更暗的冷色底）
-    let out = new THREE.Color(0.20, 0.22, 0.30);
-    let wSum = 0;
+    out.setRGB(0.9, 0.96, 0.92);
 
-    // 距离越近权重越大，形成云团渐变
+
+    // 云团叠加
     for (const b of blobs) {
       const d = p.distanceTo(b.center);
       const w = Math.max(0, 1 - d / b.r);
-      if (w > 0) {
-        out.lerp(b.color, w * 0.75);
-        wSum += w;
-      }
+      if (w > 0) out.lerp(b.color, w * 0.95);
+
+
     }
 
-    // 再加一点“整体纵向渐变”（很像生物发光）
+    // ✅ 加一点整体“上亮下暗”的冷白漂白（更像生物发光/雾）
     const ny = size.y > 0 ? (p.y - bbox.min.y) / size.y : 0.5;
-    const topTint = new THREE.Color(0.90, 0.85, 1.00);
-    out.lerp(topTint, 0.10 * ny);
+    out.lerp(new THREE.Color(0.90, 0.88, 1.00), 0.18 * ny);
+
+    out.lerp(new THREE.Color(1, 1, 1), 0.22);
 
     col.setXYZ(i, out.r, out.g, out.b);
   }

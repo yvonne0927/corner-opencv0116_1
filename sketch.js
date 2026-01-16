@@ -1,4 +1,3 @@
-// =====================
 // iPhone camera start UI
 // =====================
 let startBtn;
@@ -11,6 +10,18 @@ let modelStatus = "not started";
 let modelError = "";
 let loadedCount = 0;
 let totalCount = 0;
+
+// ✅ freeze cache：用于 lock 后保持“按下那一刻的画面数据”
+let freeze = {
+  roi: null,          // p5.Image（小缩略图）
+  roiFeats: null,     // {warmth, brightness, straightness, texture, smoothness, lineCount}
+  resultROI: null,    // classifyOrganism 的结果
+  edgePixels: 0,      // UI 用
+};
+
+let currentMatType = "none";
+let currentMatInfo = "";
+
 
 
 // Tracking (A/B stable boxes)
@@ -99,7 +110,7 @@ function toggleLock() {
   lockMode = !lockMode;
 
   if (lockMode) {
-    // 1) 锁定物种/材质（来自 stable）
+    // 1) 锁定 A/B（来自 stable）
     lockedA = (stableA.name && stableA.count >= STABLE_FRAMES)
       ? { organism: stableA.name, feats: stableA.feats }
       : null;
@@ -108,19 +119,19 @@ function toggleLock() {
       ? { organism: stableB.name, feats: stableB.feats }
       : null;
 
-    // 2) 锁定检测框（来自 track）
+    // 2) 锁定框（来自 track）
     lockedRectA = trackA ? { ...trackA } : null;
     lockedRectB = trackB ? { ...trackB } : null;
 
-    // 3) 锁定 3D 世界坐标点（来自当下 spawn2D）
+    // 3) 锁定 spawn 点（来自当前 spawn2D）
     const boxSize = Math.floor(Math.min(width, height) * 0.85);
     const bx = Math.floor((width - boxSize) / 2);
     const by = Math.floor((height - boxSize) / 2);
 
-    const spawnX = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
-    const spawnY = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
+    const sx = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
+    const sy = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
 
-    lockedHit = screenToGround(spawnX, spawnY);
+    lockedHit = screenToGround(sx, sy);
 
     if (lockBtn) lockBtn.html("Locked ✅ (tap to unlock)");
   } else {
@@ -130,9 +141,21 @@ function toggleLock() {
     lockedRectB = null;
     lockedHit = null;
 
+    // ✅ 解锁后，把 tracking 和 spawn 都重置
+    trackA = null;
+    trackB = null;
+    spawn2D.ok = false;
+
+    stableA = { name: null, count: 0, lost: 0, feats: null };
+    stableB = { name: null, count: 0, lost: 0, feats: null };
+
+    // ✅ 可选：让 3D 模型先隐藏，避免残留
+    if (three.instF) three.instF.visible = false;
+
     if (lockBtn) lockBtn.html("Lock / Unlock");
   }
 }
+
 
 
 
@@ -149,7 +172,6 @@ function toggleLock() {
         cvReady = true;
       };
 
-      // 兜底：有的构建会直接可用
       if (window.cv.Mat) {
         console.log("✅ OpenCV already ready");
         cvReady = true;
@@ -170,27 +192,26 @@ let three = {
   current: null,
   ready: false,
 
-  instA: null,  
-  instB: null, 
+  instF: null,
+
 };
 
 function initThreeOverlay() {
   const w = windowWidth;
   const h = windowHeight;
+
   if (three.renderer) return;
 
+  // 1) 先创建 scene / camera / renderer
   three.scene = new THREE.Scene();
-  // 设置视角为 60，更符合手机镜头的透视
+
   three.camera = new THREE.PerspectiveCamera(60, w / h, 0.01, 100);
-  
-  // 模拟人手持手机的高度（y轴 1.6米左右）
-  three.camera.position.set(0, 1.6, 0); 
+  three.camera.position.set(0, 1.6, 0);
 
   three.renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
   three.renderer.setSize(w, h);
   three.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  
-  // 之前的 DOM 样式设置保持不变...
+
   three.renderer.domElement.style.position = "fixed";
   three.renderer.domElement.style.left = "0";
   three.renderer.domElement.style.top = "0";
@@ -199,26 +220,35 @@ function initThreeOverlay() {
   document.body.appendChild(three.renderer.domElement);
 
   three.ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-  
-  // 移除任何关于 three.controls 的引用，确保没有 constructor 报错
-  
-  // lights 和其他 root 设置保持不变...
+
+  // 2) lights
   three.scene.add(new THREE.AmbientLight(0xffffff, 0.9));
   const dir = new THREE.DirectionalLight(0xffffff, 0.8);
   dir.position.set(1, 2, 3);
   three.scene.add(dir);
+
+  // ✅ 再补一个背光，让材质更立体（不依赖 HDR/RoomEnvironment）
+  const back = new THREE.DirectionalLight(0xffffff, 0.6);
+  back.position.set(-2, 1, -2);
+  three.scene.add(back);
+
   three.root = new THREE.Group();
   three.scene.add(three.root);
 
-  // 监听手机陀螺仪
+  // 3) ✅ 可选：环境反射（不使用 RoomEnvironment，避免你没引入时报错）
+  // 这一步不是必须；先保证不报错
+  // 如果你确实想要环境反射，看 Step 2
+
+  // 4) device orientation
   window.addEventListener('deviceorientation', (e) => {
-    rawOrientation.alpha = e.alpha || 0; // 航向角
-    rawOrientation.beta = e.beta || 0;   // 俯仰角
-    rawOrientation.gamma = e.gamma || 0; // 翻转角
+    rawOrientation.alpha = e.alpha || 0;
+    rawOrientation.beta  = e.beta  || 0;
+    rawOrientation.gamma = e.gamma || 0;
   }, true);
 
   three.ready = true;
 }
+
 
 function loadAllModels() {
   const manager = new THREE.LoadingManager();
@@ -231,12 +261,27 @@ function loadAllModels() {
   loader.setCrossOrigin("anonymous");
 
   const files = {
-    Tendril:      "models/tendril.glb",
-    Jelly:        "models/jelly.glb",
-    SporeCloud:   "models/spore.glb",
-    CrystalShell: "models/crystal.glb",
-    GlyphLight:   "models/glyph.glb"
-  };
+  "Tendril__Tendril":           "models/Tendril__Tendril.glb",
+  "Tendril__GlyphLight":        "models/Tendril__GlyphLight.glb",
+  "Tendril__CrystalShell":      "models/Tendril__CrystalShell.glb",
+  "Tendril__Jelly":             "models/Tendril__Jelly.glb",
+  "Tendril__SporeCloud":        "models/Tendril__SporeCloud.glb",
+
+  "GlyphLight__GlyphLight":     "models/GlyphLight__GlyphLight.glb",
+  "GlyphLight__CrystalShell":   "models/GlyphLight__CrystalShell.glb",
+  "GlyphLight__Jelly":          "models/GlyphLight__Jelly.glb",
+  "GlyphLight__SporeCloud":     "models/GlyphLight__SporeCloud.glb",
+
+  "SporeCloud__SporeCloud":     "models/SporeCloud__SporeCloud.glb",
+  "SporeCloud__CrystalShell":   "models/SporeCloud__CrystalShell.glb",
+  "SporeCloud__Jelly":          "models/SporeCloud__Jelly.glb",
+
+  "CrystalShell__CrystalShell": "models/CrystalShell__CrystalShell.glb",
+  "CrystalShell__Jelly":        "models/CrystalShell__Jelly.glb",
+
+  "Jelly__Jelly":               "models/Jelly__Jelly.glb",
+};
+
 
   const keys = Object.keys(files);
   totalCount = keys.length;
@@ -248,7 +293,7 @@ function loadAllModels() {
       (gltf) => {
         const obj = gltf.scene;
         obj.visible = false;
-        obj.scale.set(0.6, 0.6, 0.6);
+        obj.scale.set(1.5, 1.5, 1.5);
         obj.userData._materialCloned = false;
 
         three.models[key] = obj;
@@ -283,44 +328,31 @@ function setActiveModel(name) {
   three.current.rotation.set(0, Math.PI, 0); 
 }
 
-function ensureInstanceForSlot(slot, organismName) {
-  // slot: "A" or "B"
-  const src = three.models[organismName];
+function ensureFusionInstance(fuseName) {
+  const src = three.models[fuseName];
   if (!src) return null;
 
-  const key = (slot === "A") ? "instA" : "instB";
-  const old = three[key];
+  const old = three.instF;
+  if (old && old.userData._fusionName === fuseName) return old;
 
-  // 如果实例已经是这个类型，就不用换
-  if (old && old.userData._organismName === organismName) return old;
+  if (old) three.root.remove(old);
 
-  // 移除旧实例
-  if (old) {
-    three.root.remove(old);
-    old.traverse((c) => {
-      if (c.isMesh) {
-        if (c.geometry) c.geometry.dispose?.();
-        // 注意：material 不一定要 dispose，因为我们可能 clone 过；这里先不强制 dispose 避免误伤共享贴图
-      }
-    });
-  }
-
-  // ✅ 创建新实例（克隆）
   const inst = src.clone(true);
   inst.visible = true;
-  inst.userData._organismName = organismName;
-  inst.userData._materialCloned = false; // 给 applyAppearanceToModel 用
+  inst.userData._fusionName = fuseName;
+  inst.userData._materialCloned = false;
+  inst.userData._fusionSeed = hashStringToSeed(fuseName);
 
-  // 有些 glb 的材质/贴图在 clone 后需要确保独立
+
   inst.traverse((child) => {
     if (child.isMesh && child.material) child.material = child.material.clone();
   });
 
   three.root.add(inst);
-  three[key] = inst;
-
+  three.instF = inst;
   return inst;
 }
+
 
 
 // =====================
@@ -329,17 +361,13 @@ function ensureInstanceForSlot(slot, organismName) {
 function setup() {
   createCanvas(windowWidth, windowHeight);
   
-// ✅ 让 p5 的线框/UI 永远在最上面
+// 让 p5 的线框/UI 永远在最上面
   const c = document.querySelector("canvas");
   c.style.position = "fixed";
   c.style.left = "0";
   c.style.top = "0";
-  c.style.zIndex = "10";       // ✅ p5 在上面
+  c.style.zIndex = "10";       // p5 在上面
   c.style.pointerEvents = "none"; // 可选：不挡触控
-
-  // Three init + load models
-  // initThreeOverlay();
-  // loadAllModels();
 
   // Start Camera button
   startBtn = createButton("Start Camera");
@@ -374,7 +402,7 @@ cam.elt.setAttribute("playsinline", "");
 cam.elt.setAttribute("webkit-playsinline", "");
 cam.elt.muted = true;
 
-// ✅把 video 铺满屏幕，放在最底层
+// 把 video 铺满屏幕，放在最底层
 cam.elt.style.position = "fixed";
 cam.elt.style.left = "0";
 cam.elt.style.top = "0";
@@ -400,7 +428,7 @@ function rectCenterToScreen(r, roiW, roiH, bx, by, boxSize) {
   return { x: sx, y: sy };
 }
 
-// ✅ 由 trackA/trackB 自动算 spawn2D（并且平滑）
+// 由 trackA/trackB 自动算 spawn2D（并且平滑）
 function updateSpawnFromTracks(bx, by, boxSize, roiW, roiH) {
   // trackA / trackB 是在 ROI 坐标系里的 rect
   const hasA = !!trackA;
@@ -435,6 +463,34 @@ function updateSpawnFromTracks(bx, by, boxSize, roiW, roiH) {
   }
 }
 
+const ORG_ORDER = ["Tendril", "GlyphLight", "SporeCloud", "CrystalShell", "Jelly"]; 
+// 这个顺序随你，但要固定且与你的 15 种表一致
+
+function fusionKey(a, b) {
+  if (!a && !b) return null;
+  if (a && !b) b = a;
+  if (b && !a) a = b;
+
+  const ia = ORG_ORDER.indexOf(a);
+  const ib = ORG_ORDER.indexOf(b);
+
+  // 万一出现未知名，兜底：不排序
+  if (ia < 0 || ib < 0) return `${a}__${b}`;
+
+  return (ia <= ib) ? `${a}__${b}` : `${b}__${a}`;
+}
+
+function mergeFeats(featsA, featsB) {
+  if (featsA && featsB) {
+    return {
+      warmth:       (featsA.warmth + featsB.warmth) / 2,
+      brightness:   (featsA.brightness + featsB.brightness) / 2,
+      straightness: (featsA.straightness + featsB.straightness) / 2,
+      smoothness:   (featsA.smoothness + featsB.smoothness) / 2,
+    };
+  }
+  return featsA || featsB || null;
+}
 
 function draw() {
   clear(); // ✅透明清屏，p5 只画UI，不遮挡 three
@@ -457,8 +513,6 @@ text(`model loaded: ${Object.keys(three.models).length}`, 20, 70);
     fill(255);
     textSize(16);
     text("Tap 'Start Camera' to begin", 20, 90);
-    // 只渲染 three（也可不渲）
-   // if (three.ready) three.renderer.render(three.scene, three.camera);
     return;
   }
 
@@ -479,86 +533,92 @@ const by = Math.floor((height - boxSize) / 2);
   textSize(16);
   text(`cvReady: ${cvReady}`, 20, 20);
 
-  if (!cvReady) {
-    if (three.ready) three.renderer.render(three.scene, three.camera);
-    return;
-  }
 
-  // cvReady 通过后：
+
+// 先声明（让后面所有地方都能用）
+let roi = null;
+let roiFeats = null;
+let resultROI = null;
+let edgePixels = 0;
+
+let src = null;
+let gray = null;
+let edges = null;
+
+let topRects = [];   // 必须有默认值，否则 assignToTracks 会炸
+
+
 if (lockMode) {
-  // lock 后不再跑 OpenCV，不再更新 spawn，不再更新 boxes
-  // 只渲染 three：用 lockedHit + lockedA/B
+  // lock：不用重新算，直接用 freeze
+  roi = freeze.roi;
+  roiFeats = freeze.roiFeats;
+  resultROI = freeze.resultROI;
+  edgePixels = freeze.edgePixels;
 
-  if (three.ready) {
-    const finalHit = lockedHit;
+  if (roi) image(roi, 20, height - 140, 120, 120);
 
-    if (lockedA) {
-      const instA = ensureInstanceForSlot("A", lockedA.organism);
-      if (instA && finalHit) {
-        applyAppearanceToModel(instA, makeAppearance(lockedA.feats, lockedA.organism));
-        instA.visible = true;
-        instA.position.copy(finalHit);
-      }
-    } else if (three.instA) three.instA.visible = false;
+  // ✅ lock 时也要给 topRects 一个来源：用 lockedRectA/B
+  topRects = [];
+  if (lockedRectA) topRects.push(lockedRectA);
+  if (lockedRectB) topRects.push(lockedRectB);
 
-    if (lockedB) {
-      const instB = ensureInstanceForSlot("B", lockedB.organism);
-      if (instB && finalHit) {
-        applyAppearanceToModel(instB, makeAppearance(lockedB.feats, lockedB.organism));
-        instB.visible = true;
-        instB.position.copy(finalHit);
-      }
-    } else if (three.instB) three.instB.visible = false;
+} else {
+  const roiSize = Math.min(320, cam.width, cam.height);
+  roi = cam.get(
+    Math.floor(cam.width / 2 - roiSize / 2),
+    Math.floor(cam.height / 2 - roiSize / 2),
+    roiSize,
+    roiSize
+  );
 
-    // 相机姿态持续更新（你转手机就能“看”它）
-    let a = THREE.MathUtils.degToRad(rawOrientation.alpha);
-    let b = THREE.MathUtils.degToRad(rawOrientation.beta);
-    let g = THREE.MathUtils.degToRad(rawOrientation.gamma);
-    three.camera.rotation.set(b, a, -g, 'YXZ');
-    three.renderer.render(three.scene, three.camera);
-  }
-
-  // ✅ lock 时直接结束 draw
-  return;
-}
-
- // ✅ ROI 真实识别尺寸：限制在 cam 内（不要跟 boxSize 一样大）
-const roiSize = Math.min(320, cam.width, cam.height); // 你也可以试 240/280/320
-
-// ✅ ROI 永远取 cam 中心（稳定）
-const roi = cam.get(
-  Math.floor(cam.width / 2 - roiSize / 2),
-  Math.floor(cam.height / 2 - roiSize / 2),
-  roiSize,
-  roiSize
+  // --- always get a live frame for marker pose (even in lockMode) ---
+let poseImg = cam.get(
+  Math.floor(cam.width/2 - 160),
+  Math.floor(cam.height/2 - 160),
+  320, 320
 );
 
+let srcPose = null;
+if (cvReady && poseImg) {
+  srcPose = cv.imread(poseImg.canvas);
+
+  const quad = findMarkerQuad(srcPose);
+  markerVisible = !!quad;
+
+  if (quad) {
+    const pose = estimatePoseFromQuad(quad, srcPose.cols, srcPose.rows);
+    if (pose) {
+      if (markerPose) { markerPose.rvec.delete(); markerPose.tvec.delete(); markerPose.R.delete(); }
+      markerPose = pose;
+      applyPoseToThreeCamera(markerPose);
+    }
+  }
+
+  srcPose.delete();
+}
 
   image(roi, 20, height - 140, 120, 120);
 
-  // A) ROI features for UI
-  const roiFeats = extractFeaturesFromP5Image(roi);
-  const resultROI = classifyOrganism(
+  roiFeats = extractFeaturesFromP5Image(roi);
+  resultROI = classifyOrganism(
     roiFeats.warmth,
     roiFeats.brightness,
     roiFeats.straightness,
     roiFeats.smoothness
   );
 
-  // B) find top2 rects in ROI
-  const src = cv.imread(roi.canvas);
-  const gray = new cv.Mat();
+  src = cv.imread(roi.canvas);
+  gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  const edges = new cv.Mat();
+  edges = new cv.Mat();
   cv.Canny(gray, edges, 50, 150);
 
-  // Step1: morphology close
   const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
   cv.morphologyEx(edges, edges, cv.MORPH_CLOSE, kernel);
   kernel.delete();
 
-  const edgePixels = cv.countNonZero(edges);
+  edgePixels = cv.countNonZero(edges);
 
   const contours = new cv.MatVector();
   const hierarchy = new cv.Mat();
@@ -576,53 +636,69 @@ const roi = cam.get(
   }
 
   rects.sort((a, b) => b.area - a.area);
-
-  // IoU non-overlap pick
-  let topRects = pickTopRectsNonOverlapping(rects.map(o => o.rect), 2, 0.35);
-  // center de-dup
+  topRects = pickTopRectsNonOverlapping(rects.map(o => o.rect), 2, 0.35);
   topRects = filterDuplicateRects(topRects, 22);
 
   edgesCopy.delete();
-  contours.delete();
-  hierarchy.delete();
+contours.delete();
+hierarchy.delete();
 
-  // Step2/3: assign + smooth
+
+  // ✅ 写入 freeze（给 lock 用）
+  freeze.roi = roi;
+  freeze.roiFeats = roiFeats;
+  freeze.resultROI = resultROI;
+  freeze.edgePixels = edgePixels;
+
+  // ✅ lockMode 但 freeze 还没准备好：直接跳过本帧
+if (!roi) {
+  fill(255, 80, 80);
+  textSize(14);
+  text("freeze.roi is null (wait 1-2 frames then lock)", 20, 140);
+  return;
+}
+
+}
+
+
+
+if (!lockMode) {
   const assigned = assignToTracks(topRects, trackA, trackB);
   trackA = smoothRect(trackA, assigned.A, SMOOTH);
   trackB = smoothRect(trackB, assigned.B, SMOOTH);
+}
+
 
 // ===== Marker pose update (每帧都做，lock 也要做) =====
 markerVisible = false;
 
-const quad = findMarkerQuad(src);
-if (quad) {
-  markerVisible = true;
-
-  // 如果 src 是 ROI，你的相机内参应该用 ROI 尺寸
-  const pose = estimatePoseFromQuad(quad, src.cols, src.rows);
-
-  if (pose) {
-    // 清理上一帧 pose，避免内存泄漏
-    if (markerPose) {
-      markerPose.rvec.delete();
-      markerPose.tvec.delete();
-      markerPose.R.delete();
+if (src) {  // ✅ 没有 src（lockMode）就跳过 marker 检测
+  const quad = findMarkerQuad(src);
+  if (quad) {
+    markerVisible = true;
+    const pose = estimatePoseFromQuad(quad, src.cols, src.rows);
+    if (pose) {
+      if (markerPose) {
+        markerPose.rvec.delete();
+        markerPose.tvec.delete();
+        markerPose.R.delete();
+      }
+      markerPose = pose;
+      applyPoseToThreeCamera(markerPose);
     }
-    markerPose = pose;
-
-    applyPoseToThreeCamera(markerPose);
   }
 }
+
+
 fill(255);
 textSize(14);
 text(`marker: ${markerVisible}`, 20, 110);
 
 
-// 修改为：
-if (!lockMode) {
-  // 只有没锁定的时候才更新识别坐标
+if (!lockMode && roi) {
   updateSpawnFromTracks(bx, by, boxSize, roi.width, roi.height);
 }
+
 
   // C) stable rects -> objects
   let objects = [];
@@ -670,21 +746,35 @@ if (!lockMode) {
   textFont("monospace"); // 可选：更像调试UI
   noStroke();
 
-  const uiLines = [
-    `cvReady: ${cvReady}`,
-    `edgePixels(ROI): ${edgePixels}`,
-    `warmth (R-B): ${roiFeats.warmth.toFixed(1)}`,
-    `brightness: ${roiFeats.brightness.toFixed(2)}`,
-    `straightness: ${roiFeats.straightness.toFixed(2)} (lines: ${roiFeats.lineCount})`,
-    `texture: ${roiFeats.texture.toFixed(2)}  smoothness: ${roiFeats.smoothness.toFixed(2)}`,
-    `ROI organism: ${resultROI.organism}`,
-    `ROI confidence: ${resultROI.confidence.toFixed(2)}`,
-    `Tendril: ${resultROI.score.Tendril.toFixed(2)}`,
-    `Glyph:   ${resultROI.score.GlyphLight.toFixed(2)}`,
-    `Crystal: ${resultROI.score.CrystalShell.toFixed(2)}`,
-    `Jelly:   ${resultROI.score.Jelly.toFixed(2)}`,
-    `Spore:   ${resultROI.score.SporeCloud.toFixed(2)}`
-  ];
+  const safeFeats = roiFeats || {
+  warmth: 0, brightness: 0, straightness: 0, texture: 0, smoothness: 0, lineCount: 0
+};
+
+const safeRes = resultROI || {
+  organism: "NA",
+  confidence: 0,
+  score: { Tendril: 0, GlyphLight: 0, CrystalShell: 0, Jelly: 0, SporeCloud: 0 }
+};
+
+
+const uiLines = [
+  `cvReady: ${cvReady}`,
+  `edgePixels(ROI): ${edgePixels}`,
+  `warmth (R-B): ${safeFeats.warmth.toFixed(1)}`,
+  `brightness: ${safeFeats.brightness.toFixed(2)}`,
+  `straightness: ${safeFeats.straightness.toFixed(2)} (lines: ${safeFeats.lineCount})`,
+  `texture: ${safeFeats.texture.toFixed(2)}  smoothness: ${safeFeats.smoothness.toFixed(2)}`,
+  `ROI organism: ${safeRes.organism}`,
+  `ROI confidence: ${safeRes.confidence.toFixed(2)}`,
+  `Tendril: ${safeRes.score.Tendril.toFixed(2)}`,
+  `Glyph:   ${safeRes.score.GlyphLight.toFixed(2)}`,
+  `Crystal: ${safeRes.score.CrystalShell.toFixed(2)}`,
+  `Jelly:   ${safeRes.score.Jelly.toFixed(2)}`,
+  `Spore:   ${safeRes.score.SporeCloud.toFixed(2)}`,
+  `matType: ${currentMatType}`,
+  `matInfo: ${currentMatInfo}`,
+];
+
 
   // ✅ 背景宽度=最长字符串宽度+padding（不会再过宽）
   let maxW = 0;
@@ -734,49 +824,60 @@ if (!lockMode) {
   stableB = updateStable(stableB, objects[1] || null);
 }
 
-// F) Apply model + material + position (A & B) —— 用“稳定结果 / 锁定结果”
+// F) Apply fused model at spawn
 if (three.ready) {
   let finalHit = null;
 
-  // 1. 先统一定义当前的生成坐标 (不论是否锁定都需要这个逻辑来计算位置)
   const currentSpawnX = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
   const currentSpawnY = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
 
-  if (lockMode) {
-    // ✅ 锁定模式：直接使用保存好的位置
-    finalHit = lockedHit;
-  } else {
-    // 2) 未锁定：实时计算地面交点
-    finalHit = screenToGround(currentSpawnX, currentSpawnY);
-  }
+  finalHit = lockMode ? lockedHit : screenToGround(currentSpawnX, currentSpawnY);
 
-  // 3) 确定要显示的 A/B 逻辑
-  const showA = lockMode ? lockedA : ((stableA.name && stableA.count >= STABLE_FRAMES) ? { organism: stableA.name, feats: stableA.feats } : null);
-  const showB = lockMode ? lockedB : ((stableB.name && stableB.count >= STABLE_FRAMES) ? { organism: stableB.name, feats: stableB.feats } : null);
+  const showA = lockMode
+    ? lockedA
+    : ((stableA.name && stableA.count >= STABLE_FRAMES) ? { organism: stableA.name, feats: stableA.feats } : null);
 
-  // === 应用位置到 A ===
-  if (showA) {
-    const instA = ensureInstanceForSlot("A", showA.organism);
-    if (instA) {
-      applyAppearanceToModel(instA, makeAppearance(showA.feats, showA.organism));
-      instA.visible = true;
-      if (finalHit) instA.position.copy(finalHit);
-    }
-  } else if (three.instA) {
-    three.instA.visible = false;
-  }
+  const showB = lockMode
+    ? lockedB
+    : ((stableB.name && stableB.count >= STABLE_FRAMES) ? { organism: stableB.name, feats: stableB.feats } : null);
 
-  // === 应用位置到 B ===
-  if (showB) {
-    const instB = ensureInstanceForSlot("B", showB.organism);
-    if (instB) {
-      applyAppearanceToModel(instB, makeAppearance(showB.feats, showB.organism));
-      instB.visible = true;
-      if (finalHit) instB.position.copy(finalHit);
-    }
-  } else if (three.instB) {
-    three.instB.visible = false;
+  // ✅ 只有一个物体时：用“同种融合”(A__A)
+ const fuseName = fusionKey(showA?.organism, showB?.organism);
+
+if (fuseName && finalHit) {
+  const instF = ensureFusionInstance(fuseName);
+if (!instF) {
+  // 模型还没加载成功 or fuseName 不存在
+  if (three.instF) three.instF.visible = false;
+  return; // 或者直接跳过这一帧
+}
+
+instF.visible = true;
+instF.position.copy(finalHit);
+
+
+  instF.position.copy(finalHit);
+  instF.position.y += 0.02; // 可选：抬一点避免贴地面穿模
+
+  const featsF = mergeFeats(showA?.feats, showB?.feats);
+  if (featsF) {
+    const baseOrgForLook = showA?.organism || showB?.organism || "Tendril";
+
+    const matType = chooseMaterialType(featsF, edgePixels);
+    currentMatType = matType;
+
+    applyAppearanceToModel(
+      instF,
+      makeAppearance(featsF, baseOrgForLook),
+      matType
+    );
+
+    currentMatInfo = getMaterialInfo(instF);
   }
+} else {
+  if (three.instF) three.instF.visible = false;
+}
+
 }
 
   // =====================
@@ -800,6 +901,31 @@ if (three.ready) {
     pop();
   }
 
+// --- always get a live frame for marker pose (even in lockMode) ---
+let poseImg = cam.get(
+  Math.floor(cam.width/2 - 160),
+  Math.floor(cam.height/2 - 160),
+  320, 320
+);
+
+let srcPose = null;
+if (cvReady && poseImg) {
+  srcPose = cv.imread(poseImg.canvas);
+
+  const quad = findMarkerQuad(srcPose);
+  markerVisible = !!quad;
+
+  if (quad) {
+    const pose = estimatePoseFromQuad(quad, srcPose.cols, srcPose.rows);
+    if (pose) {
+      if (markerPose) { markerPose.rvec.delete(); markerPose.tvec.delete(); markerPose.R.delete(); }
+      markerPose = pose;
+      applyPoseToThreeCamera(markerPose);
+    }
+  }
+
+  srcPose.delete();
+}
 
 
   // Render three
@@ -810,16 +936,14 @@ if (three.ready) {
     let a = THREE.MathUtils.degToRad(rawOrientation.alpha);
     let b = THREE.MathUtils.degToRad(rawOrientation.beta);
     let g = THREE.MathUtils.degToRad(rawOrientation.gamma);
-    
-    // YXZ 顺序对手机陀螺仪最友好
-    three.camera.rotation.set(b, a, -g, 'YXZ');
-    three.renderer.render(three.scene, three.camera);
+
   }
 
   // 清理 OpenCV 内存
-  src.delete();
-  gray.delete();
-  edges.delete();
+  if (src) src.delete();
+if (gray) gray.delete();
+if (edges) edges.delete();
+
 } // 这是 draw 函数的结束括号
 
 
@@ -1085,11 +1209,19 @@ function makeAppearance(feats, organism) {
   const S = clamp01(feats.straightness);
   const M = clamp01(feats.smoothness);
 
-  const cold = { r: 130, g: 170, b: 255 };
-  const warm = { r: 180, g: 255, b: 170 };
+  // 更“冷光 + 忧郁”的两端：蓝紫 ↔ 粉琥珀（避免绿）
+const cold = { r: 120, g: 160, b: 255 };   // 冷蓝
+const warm = { r: 255, g: 140, b: 210 };   // 粉紫 / 珠光感
 
-  const base = lerpRGB(cold, warm, W);
-  const base2 = lerpRGB({ r: 0, g: 0, b: 0 }, base, 0.35 + 0.65 * B);
+let base = lerpRGB(cold, warm, W);
+
+// ✅ 再加一点变化：让不同“形态特征”带来不同色偏
+// straightness 高 → 偏蓝紫；brightness 高 → 偏粉白
+const tintA = lerpRGB({ r: 160, g: 130, b: 255 }, { r: 255, g: 220, b: 240 }, B);
+base = lerpRGB(base, tintA, 0.35);
+
+// ✅ 最终再压暗一点（保持你的 melancholy）
+const base2 = lerpRGB({ r: 0, g: 0, b: 0 }, base, 0.45 + 0.55 * B);
 
   let opacity = clamp01(0.35 + 0.55 * M);
   let roughness = clamp01(0.85 - 0.75 * M);
@@ -1137,40 +1269,102 @@ function makeAppearance(feats, organism) {
   };
 }
 
-function applyAppearanceToModel(model, app) {
+function applyAppearanceToModel(model, app, presetType = null) {
   if (!model) return;
 
-  // ✅ 只 clone 一次（否则每帧 clone 会爆内存/卡死）
-  if (!model.userData._materialCloned) {
-    model.traverse((child) => {
-      if (child.isMesh && child.material) {
-        child.material = child.material.clone();
-      }
-    });
-    model.userData._materialCloned = true;
-  }
+  const preset = presetType ? getMaterialPreset(presetType) : null;
+
+  // ✅ 第一次：把 mesh 材质换成 MeshPhysicalMaterial（玻璃/雾/珠光需要它）
+if (!model.userData._materialCloned) {
+  const seed = (model.userData._fusionSeed ?? 12345);
 
   model.traverse((child) => {
-    if (child.isMesh && child.material) {
-      child.material.transparent = true;
-      child.material.opacity = app.opacity;
+    if (!child.isMesh) return;
 
-      if (child.material.color) {
-        child.material.color.setRGB(app.baseColor.r / 255, app.baseColor.g / 255, app.baseColor.b / 255);
-      }
+    const old = child.material || {};
 
-      if ("roughness" in child.material) child.material.roughness = app.roughness;
-      if ("metalness" in child.material) child.material.metalness = app.metalness;
+    child.material = new THREE.MeshPhysicalMaterial({
+      map: old.map || null,
+      normalMap: old.normalMap || null,
+      roughnessMap: old.roughnessMap || null,
+      metalnessMap: old.metalnessMap || null,
+      emissiveMap: old.emissiveMap || null,
+      aoMap: old.aoMap || null,
 
-      if (child.material.emissive) {
-        child.material.emissive.setRGB(app.emissiveColor.r / 255, app.emissiveColor.g / 255, app.emissiveColor.b / 255);
-        child.material.emissiveIntensity = app.emissiveStrength;
-      }
+      color: old.color ? old.color.clone() : new THREE.Color(1, 1, 1),
 
-      child.material.needsUpdate = true;
+      vertexColors: true,  // ✅ 启用顶点颜色
+      transparent: false
+    });
+
+    // ✅ 只做一次：给这个 mesh 写入随机渐变（位置/大小随机，但可复现）
+    applyVertexGradient(child, seed + (child.id % 9999));
+  });
+
+  model.userData._materialCloned = true;
+}
+
+
+
+  model.traverse((child) => {
+    if (!child.isMesh || !child.material) return;
+    const mat = child.material;
+
+    // 颜色（沿用你 app）
+    if (mat.color) {
+      mat.color.setRGB(app.baseColor.r / 255, app.baseColor.g / 255, app.baseColor.b / 255);
     }
+
+    // 默认用 app
+    mat.transparent = false;
+    mat.opacity =  1.0;
+    mat.roughness = app.roughness;
+    mat.metalness = app.metalness;
+
+    // 叠加 preset（玻璃/金属/珍珠/陶土/雾）
+    if (preset) {
+      const isTrans = (presetType === "glass" || presetType === "foggy");
+mat.transparent = isTrans;
+mat.opacity = isTrans ? 1.0 : 1.0; // 玻璃用 transmission，不靠 opacity
+
+      mat.roughness = preset.roughness;
+      mat.metalness = preset.metalness;
+
+      mat.transmission = isTrans ? (preset.transmission ?? 0.0) : 0.0;
+mat.thickness    = isTrans ? (preset.thickness ?? 0.0) : 0.0;
+mat.ior          = isTrans ? (preset.ior ?? 1.0) : 1.0;
+
+
+      mat.clearcoat = preset.clearcoat ?? 0.0;
+      mat.clearcoatRoughness = preset.clearcoatRoughness ?? 0.0;
+
+      // 玻璃/雾：优先 transmission，不要靠 opacity 做透明
+      if ((preset.transmission ?? 0) > 0) mat.opacity = 1.0;
+
+      // 珍珠：iridescence（做兼容，不支持就跳过）
+      if ("iridescence" in mat && preset.iridescence != null) {
+        mat.iridescence = preset.iridescence;
+        mat.iridescenceIOR = preset.iridescenceIOR ?? 1.3;
+        if ("iridescenceThicknessRange" in mat && preset.iridescenceThicknessRange) {
+          mat.iridescenceThicknessRange = preset.iridescenceThicknessRange;
+        }
+      }
+    } else {
+      mat.transmission = 0.0;
+      mat.thickness = 0.0;
+      mat.clearcoat = 0.0;
+    }
+
+    // emissive（沿用你 app）
+    if (mat.emissive) {
+      mat.emissive.setRGB(app.emissiveColor.r / 255, app.emissiveColor.g / 255, app.emissiveColor.b / 255);
+      mat.emissiveIntensity = app.emissiveStrength + (preset?.emissiveBoost || 0);
+    }
+
+    mat.needsUpdate = true;
   });
 }
+
 
 function screenToGround(sx, sy) {
   const mouse = new THREE.Vector2();
@@ -1260,8 +1454,13 @@ function findMarkerQuad(srcRGBA) {
     cnt.delete();
   }
 
-  gray.delete(); blur.delete(); edges.delete();
-  contours.delete(); hierarchy.delete();
+   // ✅ 清理 OpenCV 内存（findMarkerQuad 内部自己创建的才 delete）
+  gray.delete();
+  blur.delete();
+  edges.delete();
+  contours.delete();
+  hierarchy.delete();
+
 
   if (!best) return null;
   return orderCorners(best); // TL TR BR BL
@@ -1359,4 +1558,217 @@ function applyPoseToThreeCamera(pose) {
   // three 需要更新 inverse
   three.camera.matrixWorld.copy(three.camera.matrix);
   three.camera.matrixWorldInverse.copy(three.camera.matrix).invert();
+}
+
+function getMaterialPreset(type) {
+  switch (type) {
+    case "glass": // 透明玻璃
+      return {
+        transmission: 1.0,
+        ior: 1.45,
+        thickness: 0.12,
+        roughness: 0.03,
+        metalness: 0.0,
+        opacity: 1.0,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.04,
+        emissiveBoost: 0.0
+      };
+
+    case "metal": // 金属
+      return {
+        transmission: 0.0,
+        ior: 1.0,
+        thickness: 0.0,
+        roughness: 0.2,
+        metalness: 1.0,
+        opacity: 1.0,
+        clearcoat: 0.15,
+        clearcoatRoughness: 0.2,
+        emissiveBoost: 0.0
+      };
+
+    case "pearl": // 珍珠 / 珠光
+      return {
+        transmission: 0.0,
+        ior: 1.3,
+        thickness: 0.0,
+        roughness: 0.25,
+        metalness: 0.15,
+        opacity: 1.0,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.08,
+        iridescence: 1.0,
+        iridescenceIOR: 1.3,
+        iridescenceThicknessRange: [120, 420],
+        emissiveBoost: 0.0
+      };
+
+    case "clay": // 哑光陶土
+      return {
+        transmission: 0.0,
+        ior: 1.0,
+        thickness: 0.0,
+        roughness: 0.92,
+        metalness: 0.0,
+        opacity: 1.0,
+        clearcoat: 0.0,
+        clearcoatRoughness: 1.0,
+        emissiveBoost: 0.0
+      };
+
+    case "foggy": // 半透明雾蒙蒙（磨砂乳白）
+      return {
+        transmission: 0.65,
+        ior: 1.25,
+        thickness: 0.28,
+        roughness: 0.65,
+        metalness: 0.0,
+        opacity: 1.0,
+        clearcoat: 0.15,
+        clearcoatRoughness: 0.55,
+        emissiveBoost: 0.05
+      };
+  }
+  return null;
+}
+
+function chooseMaterialType(featsF, edgePixels = 0) {
+  if (!featsF) return "clay";
+
+  const B = clamp01(featsF.brightness);   // 0-1
+  const S = clamp01(featsF.straightness); // 0-1
+  const M = clamp01(featsF.smoothness);   // 0-1
+  const W = clamp01((featsF.warmth + 60) / 120); // 0-1（你已有 normWarmth 也行）
+
+  // 规则（你可以之后微调阈值）
+  // 1) 很亮 + 很光滑 => 玻璃
+  if (B > 0.68 && M > 0.70 && S < 0.55) return "glass";
+
+  // 2) 线性/结构感强（很多直线）=> 金属
+  if (S > 0.65 && B > 0.45) return "metal";
+
+  // 3) 亮 + 中等光滑 + 不太直 => 珍珠
+  if (B > 0.55 && M > 0.55 && S < 0.55) return "pearl";
+
+  // 4) 不亮但光滑 => 雾蒙蒙半透
+  if (B < 0.55 && M > 0.65) return "foggy";
+
+  // 5) 其它：更粗糙、偏暖 => 陶土
+  return "clay";
+}
+
+function getMaterialInfo(model) {
+  if (!model) return "no model";
+
+  let firstMat = null;
+  model.traverse((c) => {
+    if (!firstMat && c.isMesh && c.material) firstMat = c.material;
+  });
+  if (!firstMat) return "no material";
+
+  const m = firstMat;
+
+  const type = m.type || "unknown";
+  const hasMap = !!m.map;
+
+  const tr = ("transmission" in m) ? Number(m.transmission).toFixed(2) : "NA";
+  const ro = ("roughness" in m) ? Number(m.roughness).toFixed(2) : "NA";
+  const me = ("metalness" in m) ? Number(m.metalness).toFixed(2) : "NA";
+  const op = ("opacity" in m) ? Number(m.opacity).toFixed(2) : "NA";
+
+  const iri = ("iridescence" in m) ? Number(m.iridescence).toFixed(2) : "NA";
+
+  return `${type} map:${hasMap} tr:${tr} ro:${ro} me:${me} op:${op} iri:${iri}`;
+}
+
+function seededRand(seed) {
+  // 简单可复现随机：0~1
+  seed = (seed * 1664525 + 1013904223) >>> 0;
+  return seed / 4294967296;
+}
+function applyVertexGradient(mesh, seed = 1234) {
+  const geo = mesh.geometry;
+  if (!geo || !geo.attributes || !geo.attributes.position) return;
+
+  // 先保证是 BufferGeometry 且有 bounding box
+  geo.computeBoundingBox();
+  const bbox = geo.boundingBox;
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+
+  const pos = geo.attributes.position;
+  const count = pos.count;
+
+  // 准备 color attribute
+  let col = geo.getAttribute('color');
+  if (!col || col.count !== count) {
+    col = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
+    geo.setAttribute('color', col);
+  }
+
+  // 随机生成 4 个“色云中心”
+  let s = seed >>> 0;
+  const blobs = [];
+  const blobN = 4;
+
+  for (let i = 0; i < blobN; i++) {
+    const rx = seededRand(s = (s + 1) >>> 0);
+    const ry = seededRand(s = (s + 1) >>> 0);
+    const rz = seededRand(s = (s + 1) >>> 0);
+
+    // 中心在 bbox 内随机
+    const cx = bbox.min.x + rx * size.x;
+    const cy = bbox.min.y + ry * size.y;
+    const cz = bbox.min.z + rz * size.z;
+
+    // 半径随机（决定渐变块大小）
+    const r = (0.25 + 0.55 * seededRand(s = (s + 1) >>> 0)) * Math.max(size.x, size.y, size.z);
+
+    // 颜色随机（你的“冷光忧郁”色域：蓝紫/粉紫/冷白）
+    const t = seededRand(s = (s + 1) >>> 0);
+    const c1 = new THREE.Color().setHSL(0.65 + 0.15 * t, 0.55, 0.55); // 偏蓝紫
+    const c2 = new THREE.Color().setHSL(0.85 - 0.2 * t, 0.55, 0.62);  // 偏粉紫
+    const color = c1.lerp(c2, seededRand(s = (s + 1) >>> 0));
+
+    blobs.push({ center: new THREE.Vector3(cx, cy, cz), r, color });
+  }
+
+  const p = new THREE.Vector3();
+
+  for (let i = 0; i < count; i++) {
+    p.fromBufferAttribute(pos, i);
+
+    // 基础色（你也可以改成更暗的冷色底）
+    let out = new THREE.Color(0.20, 0.22, 0.30);
+    let wSum = 0;
+
+    // 距离越近权重越大，形成云团渐变
+    for (const b of blobs) {
+      const d = p.distanceTo(b.center);
+      const w = Math.max(0, 1 - d / b.r);
+      if (w > 0) {
+        out.lerp(b.color, w * 0.75);
+        wSum += w;
+      }
+    }
+
+    // 再加一点“整体纵向渐变”（很像生物发光）
+    const ny = size.y > 0 ? (p.y - bbox.min.y) / size.y : 0.5;
+    const topTint = new THREE.Color(0.90, 0.85, 1.00);
+    out.lerp(topTint, 0.10 * ny);
+
+    col.setXYZ(i, out.r, out.g, out.b);
+  }
+
+  col.needsUpdate = true;
+}
+
+function hashStringToSeed(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
